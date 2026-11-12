@@ -1090,6 +1090,73 @@ class VmdkTests(TemporaryTestCase):
                     self.assertEqual(command.returncode, 0, command.stdout + command.stderr)
 
 
+class VmConfigTests(unittest.TestCase):
+    current = """# Current configuration; [not-a-section]
+name: current-vm
+cores: 4
+sockets: 2
+memory: 8192
+bios: ovmf
+scsihw: virtio-scsi-single
+scsi0: fast-thin:vm-880-disk-0,size=32G
+virtio1: file=fast-thin:vm-880-disk-1,size=16G
+sata2: archive-thin:vm-880-disk-2,size=8G
+ide2: local:iso/installer.iso,media=cdrom
+unused0: old-storage:vm-880-disk-9
+net0: virtio=00:11:22:33:44:55,bridge=vmbr-current
+"""
+
+    def parse(self, text):
+        with patch.object(pv.Path, "exists", return_value=True), \
+                patch.object(pv.Path, "read_text", return_value=text) as read:
+            config = pv._vm_config(880)
+        read.assert_called_once_with()
+        return config
+
+    def test_current_configuration_without_snapshots(self):
+        self.assertEqual(self.parse(self.current), {
+            "name": "current-vm", "cores": 4, "sockets": 2, "vcpus": 8,
+            "memory": 8192, "bios": "ovmf", "scsihw": "virtio-scsi-single",
+            "disks": ["fast-thin:vm-880-disk-0", "fast-thin:vm-880-disk-1",
+                      "archive-thin:vm-880-disk-2"],
+            "networks": ["vmbr-current"],
+        })
+
+    def test_snapshots_cannot_duplicate_disks_or_override_current_settings(self):
+        snapshots = """
+   [before-upgrade]
+name: old-vm
+cores: 1
+sockets: 1
+memory: 512
+bios: seabios
+scsihw: lsi
+scsi0: fast-thin:vm-880-disk-0,size=32G
+scsi1: old-storage:vm-880-disk-7,size=8G
+net0: virtio=00:11:22:33:44:55,bridge=vmbr-old
+efidisk0: old-storage:vm-880-disk-8
+
+[older-snapshot]
+virtio0: removed-storage:vm-880-disk-6,size=4G
+memory: not-a-current-value
+"""
+        with patch.object(pv, "log") as log:
+            self.assertEqual(self.parse(self.current + snapshots), self.parse(self.current))
+            log.warning.assert_not_called()
+
+    def test_snapshot_only_disks_are_not_exported(self):
+        config = self.parse("name: diskless\n\n[old]\nscsi0: old-storage:vm-880-disk-0\n")
+        self.assertEqual(config["disks"], [])
+        self.assertEqual(config["name"], "diskless")
+
+    def test_pending_and_snapshot_sections_are_not_current_configuration(self):
+        sections = ("[PENDING]\nscsi0: future-storage:vm-880-disk-0\ncores: 16\n",
+                    "[snapshot]\nscsi1: old-storage:vm-880-disk-1\n")
+        for suffix in (sections[0], "".join(sections), "".join(reversed(sections))):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(self.parse(self.current + suffix), self.parse(self.current))
+
+
 class MainTests(TemporaryTestCase):
     @contextmanager
     def environment(self, flags=(), disks=1, real_writer=False):

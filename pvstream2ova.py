@@ -799,6 +799,8 @@ def _vm_config(vmid: int) -> dict:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        if line.startswith("["):
+            break
         key, _, val = line.partition(":")
         key = key.strip(); val = val.strip()
 
