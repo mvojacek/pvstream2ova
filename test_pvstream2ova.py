@@ -871,8 +871,14 @@ class VmdkTests(TemporaryTestCase):
         sizing.assert_called_once_with(str(source))
         data = destination.read_bytes()
         self.assertEqual(digest, hashlib.sha256(data).hexdigest())
-        self.assertEqual(progress, [(min(end, size), size)
-                                    for end in range(GRAIN, size + GRAIN, GRAIN)])
+        target = sum(hi - lo for lo, hi in allowed)
+        expected_progress = []
+        for end in range(pv.BATCH_GRAINS * GRAIN, size + pv.BATCH_GRAINS * GRAIN,
+                         pv.BATCH_GRAINS * GRAIN):
+            done = sum(max(0, min(hi, end) - lo) for lo, hi in allowed)
+            if done < target:
+                expected_progress.append((done, target))
+        self.assertEqual(progress, expected_progress + [(target, target)])
         self.assertEqual(sum(returned), sum(hi - lo for lo, hi in allowed))
         if short is None:
             self.assertEqual(sum(length for _, length in reads), sum(returned))
@@ -880,7 +886,9 @@ class VmdkTests(TemporaryTestCase):
         assert_logical_contents(self, decoded, size, pieces)
         self.assertEqual(len(compressed), len(decoded.grains))
         return SimpleNamespace(source=source, destination=destination, data=data, decoded=decoded,
-                               reads=reads, batches=batches, compressed=compressed, digest=digest)
+                               reads=reads, batches=batches, compressed=compressed, digest=digest,
+                               progress=progress)
+
 
     def test_fully_allocated_empty_and_mapped_zero_devices(self):
         size = 2 * GRAIN + 512
@@ -897,6 +905,20 @@ class VmdkTests(TemporaryTestCase):
                 else:
                     self.assertEqual(result.reads, [(0, size)])
                     self.assertEqual(len(result.batches), 1)
+
+    def test_progress_counts_source_reads_including_zero_data_not_holes_or_padding(self):
+        size = 9 * GRAIN + 512
+        pieces = [(0, b"A" * 512), (8 * GRAIN, b"B" * 512)]
+        ranges = [(0, 512), (3 * GRAIN, 3 * GRAIN + 1024), (8 * GRAIN, 8 * GRAIN + 512)]
+        with patch.object(pv, "BATCH_GRAINS", 2):
+            sparse = self.convert(size, pieces, ranges, "progress-sparse")
+            dense = self.convert(size, pieces, None, "progress-dense")
+            empty = self.convert(size, [], [], "progress-empty")
+        self.assertEqual(sparse.progress, [(512, 2048), (1536, 2048), (1536, 2048),
+                                           (1536, 2048), (2048, 2048)])
+        self.assertEqual(dense.progress, [(2 * GRAIN, size), (4 * GRAIN, size),
+                                          (6 * GRAIN, size), (8 * GRAIN, size), (size, size)])
+        self.assertEqual(empty.progress, [(0, 0)])
 
     def test_subgrain_holes_and_fragmented_ranges(self):
         size = 3 * GRAIN + 512
@@ -1090,6 +1112,45 @@ class VmdkTests(TemporaryTestCase):
                     self.assertEqual(command.returncode, 0, command.stdout + command.stderr)
 
 
+class ProgressTests(unittest.TestCase):
+    def test_source_read_speed_target_and_eta(self):
+        with patch.object(pv.time, "monotonic", side_effect=[0, 2, 4]), \
+                patch("builtins.print") as output, patch.object(pv, "log") as log:
+            progress = pv._make_progress("disk0", 8 << 20, source_read=True)
+            progress(4 << 20, 8 << 20)
+            progress(8 << 20, 8 << 20)
+        first, final = (entry.args[0] for entry in output.call_args_list)
+        self.assertIn("50%  4/8 MiB", first)
+        self.assertIn("2.0 read MiB/s", first)
+        self.assertIn("ETA 2s", first)
+        self.assertIn("100%  8/8 MiB", final)
+        self.assertEqual(log.info.call_args.args[1:7], ("disk0", 100, 8, 8, 2.0, "read MiB/s"))
+
+    def test_empty_source_finishes_at_100_percent_without_division_by_zero(self):
+        with patch.object(pv.time, "monotonic", side_effect=[0, 2]), \
+                patch("builtins.print") as output, patch.object(pv, "log"):
+            pv._make_progress("disk0", 0, source_read=True)(0, 0)
+        self.assertIn("100%  0/0 MiB", output.call_args.args[0])
+        self.assertIn("0.0 read MiB/s", output.call_args.args[0])
+        self.assertIn("ETA 0s", output.call_args.args[0])
+        output.assert_called_once()
+
+    def test_leading_holes_have_unknown_eta_until_data_is_processed(self):
+        with patch.object(pv.time, "monotonic", side_effect=[0, 2]), \
+                patch("builtins.print") as output, patch.object(pv, "log"):
+            pv._make_progress("disk0", 8 << 20, source_read=True)(0, 8 << 20)
+        self.assertIn("0%  0/8 MiB", output.call_args.args[0])
+        self.assertIn("0.0 read MiB/s", output.call_args.args[0])
+        self.assertIn("ETA --", output.call_args.args[0])
+
+    def test_packing_throughput_label_is_unchanged(self):
+        with patch.object(pv.time, "monotonic", side_effect=[0, 2]), \
+                patch("builtins.print") as output, patch.object(pv, "log"):
+            pv._make_progress("pack:disk0", 4 << 20)(4 << 20, 4 << 20)
+        self.assertIn("2.0 MiB/s", output.call_args.args[0])
+        self.assertNotIn("read MiB/s", output.call_args.args[0])
+
+
 class VmConfigTests(unittest.TestCase):
     current = """# Current configuration; [not-a-section]
 name: current-vm
@@ -1246,7 +1307,7 @@ class MainTests(TemporaryTestCase):
             state.storage.assert_called_once_with(["arbitrary-storage:disk-0", "arbitrary-storage:disk-1"])
             payloads = self.assert_manifest(state.output / "synthetic.ova")
             self.assertEqual(payloads["synthetic-disk1.vmdk"], b"synthetic disk 1")
-            self.assertIn(call("disk0", 2 * GRAIN + 512, logical=True), state.progress.call_args_list)
+            self.assertIn(call("disk0", 1024, source_read=True), state.progress.call_args_list)
 
     def test_full_read_bypasses_all_thin_metadata_and_preserves_zero_omission(self):
         real_pread = os.pread
@@ -1257,6 +1318,7 @@ class MainTests(TemporaryTestCase):
             state.map.assert_not_called()
             state.reserve.assert_not_called()
             self.assertEqual(state.size.call_count, 2)
+            self.assertIn(call("disk0", 2 * GRAIN + 512, source_read=True), state.progress.call_args_list)
             self.assertEqual(pread.call_count, 1)
             self.assertEqual(pread.call_args.args[1:], (2 * GRAIN + 512, 0))
             payloads = self.assert_manifest(state.output / "synthetic.ova")

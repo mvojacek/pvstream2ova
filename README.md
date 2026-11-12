@@ -62,7 +62,7 @@ Discovery follows device-mapper **major/minor identifiers**, supporting arbitrar
 
 Logical VMDK holes omit unmapped/all-zero grain payloads while preserving virtual disk capacity and offsets. This is separate from **physical hole punching during OVA packaging**, which releases already-packed portions of the intermediate VMDK on the output filesystem.
 
-Conversion speed is **logical throughput** (virtual disk bytes processed per second, including skipped ranges), not physical source-read bandwidth. Per-disk reporting distinguishes logical size, mapped bytes to read, and skipped bytes; progress advances through skipped ranges too.
+Conversion progress, target size, ETA, and speed use **bytes actually read from the source**, not virtual disk capacity. The target is the mapped byte count, or the full device size with `--no-thin-map`. Skipped holes and final-grain padding do not count; mapped zero-filled data does. Progress is credited as read batches finish conversion, and an entirely unmapped disk completes at 100% with 0/0 bytes. Speed is source bytes per elapsed conversion time, not a measurement of underlying hardware I/O or cache misses. The per-disk summary still reports logical size and skipped bytes; OVA packing throughput is unchanged.
 
 ### Export workflow
 
@@ -222,7 +222,7 @@ Il rilevamento segue gli **identificatori major/minor** di device-mapper e suppo
 
 I buchi logici del VMDK omettono i payload dei grain non mappati/interamente zero, preservando capacità e offset del disco virtuale. Sono distinti dall'**hole punching fisico durante il packaging OVA**, che libera sul filesystem di output le porzioni del VMDK intermedio già inserite nell'archivio.
 
-La velocità di conversione è **throughput logico** (byte del disco virtuale elaborati al secondo, inclusi gli intervalli saltati), non banda fisica di lettura dalla sorgente. Il riepilogo per disco distingue dimensione logica, byte mappati da leggere e byte saltati; l'avanzamento comprende anche gli intervalli saltati.
+Avanzamento, obiettivo, ETA e velocità di conversione usano i **byte effettivamente letti dalla sorgente**, non la capacità del disco virtuale. L'obiettivo è il numero di byte mappati, oppure l'intera dimensione del dispositivo con `--no-thin-map`. I buchi saltati e il padding del grain finale non contano; i dati mappati contenenti solo zeri sì. L'avanzamento viene aggiornato al completamento della conversione dei batch letti; un disco interamente non mappato termina al 100% con 0/0 byte. La velocità indica i byte sorgente per il tempo di conversione trascorso, non misura l'I/O hardware sottostante né i cache miss. Il riepilogo per disco riporta ancora dimensione logica e byte saltati; il throughput del packaging OVA resta invariato.
 
 ### Workflow export
 

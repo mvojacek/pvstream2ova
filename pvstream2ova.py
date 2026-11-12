@@ -303,6 +303,8 @@ class VmdkWriter:
         pending      = []
         next_submit  = 0
         range_cursor = 0
+        read_target = (src_size if self._ranges is None else
+                       sum(end - start for start, end in self._ranges))
 
         def submit_next() -> None:
             nonlocal next_submit, range_cursor
@@ -314,8 +316,10 @@ class VmdkWriter:
             end = min(start + count * GRAIN_SIZE, src_size)
             mapped_grains = None
             raw = None
+            bytes_read = 0
             if self._ranges is None:
                 raw = _pread_exact(src_fd, end - start, start)
+                bytes_read = len(raw)
                 raw += b"\x00" * (count * GRAIN_SIZE - len(raw))
             else:
                 while range_cursor < len(self._ranges):
@@ -327,7 +331,9 @@ class VmdkWriter:
                         if raw is None:
                             raw = bytearray(count * GRAIN_SIZE)
                             mapped_grains = bytearray(count)
-                        raw[lo - start:stop - start] = _pread_exact(src_fd, stop - lo, lo)
+                        data = _pread_exact(src_fd, stop - lo, lo)
+                        raw[lo - start:stop - start] = data
+                        bytes_read += len(data)
                         first = (lo - start) // GRAIN_SIZE
                         last = (stop - start - 1) // GRAIN_SIZE + 1
                         mapped_grains[first:last] = b"\x01" * (last - first)
@@ -336,7 +342,7 @@ class VmdkWriter:
                     range_cursor += 1
             future = (pool.submit(_compress_batch, raw, self._level, mapped_grains)
                       if raw is not None else None)
-            pending.append((bs, count, future))
+            pending.append((bs, count, bytes_read, future))
             next_submit += count
 
         # Prefill queue with 2× workers batches so threads stay busy while results are consumed
@@ -344,8 +350,9 @@ class VmdkWriter:
             submit_next()
 
         grains_done = 0
+        bytes_done = 0
         while pending:
-            batch_start, count, future = pending.pop(0)
+            batch_start, count, bytes_read, future = pending.pop(0)
             submit_next()
             compressed = future.result() if future is not None else [None] * count
             if len(compressed) != count or batch_start != grains_done:
@@ -361,13 +368,16 @@ class VmdkWriter:
                 grains_done += 1
                 if grains_done % GT_COVERAGE == 0:
                     flush_gt(grains_done - GT_COVERAGE)
-                if self._progress:
-                    self._progress(min(grains_done * GRAIN_SIZE, src_size), src_size)
+            bytes_done += bytes_read
+            if self._progress and bytes_done < read_target:
+                self._progress(bytes_done, read_target)
 
         if grains_done % GT_COVERAGE:
             flush_gt(grains_done - grains_done % GT_COVERAGE)
         if grains_done != n_grains or len(gd_entries) != (n_grains + GT_COVERAGE - 1) // GT_COVERAGE:
             raise RuntimeError("Incomplete VMDK grain tables")
+        if bytes_done != read_target:
+            raise RuntimeError("Source read byte count does not match the read target")
 
         gd_data  = struct.pack(f"<{len(gd_entries)}I", *gd_entries)
         gd_pad   = (-len(gd_data)) % 512
@@ -381,6 +391,8 @@ class VmdkWriter:
         write_sectors(_meta_marker(1, _MARKER_FOOT))
         write_sectors(_vmdk_header(capacity_sectors, gd_offset=gd_data_sector, rgd_offset=0))
         write_sectors(_meta_marker(0, _MARKER_EOS))
+        if self._progress:
+            self._progress(bytes_done, read_target)
 
 
 # ── Proxmox helpers ───────────────────────────────────────────────────────────
@@ -954,7 +966,7 @@ def _fmt_dur(s: float) -> str:
     return f"{h}h {m:02d}m {s:02d}s" if h else (f"{m}m {s:02d}s" if m else f"{s}s")
 
 
-def _make_progress(label: str, total: int, logical: bool = False) -> Callable[[int, int], None]:
+def _make_progress(label: str, total: int, source_read: bool = False) -> Callable[[int, int], None]:
     t0 = time.monotonic(); last_logged = [-1]; last_print = [0.0]
 
     def show(done: int, _total: int) -> None:
@@ -962,13 +974,14 @@ def _make_progress(label: str, total: int, logical: bool = False) -> Callable[[i
         if now - last_print[0] < 1.0 and done < _total:
             return
         last_print[0] = now
-        pct = done * 100 // _total if _total else 0
+        pct = done * 100 // _total if _total else 100
         if dt > 0:
             speed = done / dt / (1 << 20)
-            eta   = _fmt_dur((_total - done) / (done / dt) if done else 0)
+            eta   = (_fmt_dur((_total - done) / (done / dt)) if done else
+                     ("0s" if not _total else "--"))
         else:
             speed = 0.0; eta = "--"
-        unit = "logical MiB/s" if logical else "MiB/s"
+        unit = "read MiB/s" if source_read else "MiB/s"
         print(f"\r  {pct:3d}%  {done >> 20}/{_total >> 20} MiB"
               f"  {speed:.1f} {unit}  {_fmt_dur(dt)} elapsed  ETA {eta}   ",
               end="", flush=True)
@@ -1095,14 +1108,13 @@ def main() -> None:
                 mapped_ranges = None if args.no_thin_map else _thin_map(lv_path, vsize)
                 mapped_bytes = (vsize if mapped_ranges is None else
                                 sum(end - start for start, end in mapped_ranges))
-                summary = (f"Logical size: {vsize} bytes; "
-                           f"{'full-device' if mapped_ranges is None else 'mapped'} bytes to read: "
-                           f"{mapped_bytes}; skipped: {vsize - mapped_bytes} bytes")
+                summary = (f"Source read target: {mapped_bytes} bytes; "
+                           f"skipped: {vsize - mapped_bytes} bytes; logical size: {vsize} bytes")
                 print(f"  {summary}")
                 log.info("[disk %d] %s", i, summary)
                 vmdk_sha = VmdkWriter(
                     src=lv_path, dst=vmdk, workers=args.workers, level=args.level,
-                    on_progress=_make_progress(f"disk{i}", vsize, logical=True),
+                    on_progress=_make_progress(f"disk{i}", mapped_bytes, source_read=True),
                     mapped_ranges=mapped_ranges, src_size=vsize,
                 ).convert()
                 if _vm_status(args.vmid) != "stopped":
@@ -1113,9 +1125,10 @@ def main() -> None:
             elapsed   = time.monotonic() - t_disk
             vmdk_size = vmdk.stat().st_size
             print(f"\n  → {vmdk.name}  {vmdk_size >> 20} MiB"
-                  f"  ({_fmt_dur(elapsed)}, {vsize / elapsed / (1 << 20):.1f} logical MiB/s)")
-            log.info("[disk %d] done: %d MiB → %d MiB in %s",
-                     i, vsize >> 20, vmdk_size >> 20, _fmt_dur(elapsed))
+                  f"  ({_fmt_dur(elapsed)}, {mapped_bytes / elapsed / (1 << 20):.1f} read MiB/s)")
+            log.info("[disk %d] done: %d bytes read → %d MiB in %s (%.1f read MiB/s)",
+                     i, mapped_bytes, vmdk_size >> 20, _fmt_dur(elapsed),
+                     mapped_bytes / elapsed / (1 << 20))
 
             if args.verify:
                 print(f"  Verify {vmdk.name}...")
