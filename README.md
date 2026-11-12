@@ -12,8 +12,9 @@ Export Proxmox VM to OVA with streaming hole-punch and parallel VMDK compression
 
 ### Features
 
+- **Allocation-aware reads by default**: skip unmapped LVM-thin ranges; `--no-thin-map` explicitly selects full-device reads
 - **Parallel zlib**: each 64 KiB VMDK grain is compressed in a separate thread via `ThreadPoolExecutor` — default `min(32, cpu_count)` threads, ~476 MiB/s on a 100 GB disk
-- **Hole-punch streaming**: the VMDK is hole-punched (`fallocate FALLOC_FL_PUNCH_HOLE`) as it is streamed into the OVA — peak disk usage equals the final OVA size, never more
+- **Physical hole-punch streaming**: the VMDK is hole-punched (`fallocate FALLOC_FL_PUNCH_HOLE`) as it is streamed into the OVA — peak disk usage equals the final OVA size, never more
 - OVF 1.0 + SHA256 manifest (.mf) for VMware / VirtualBox / QNAP compatibility
 - Automatic warnings: VirtIO SCSI controller, efidisk0 skip, BIOS OVMF
 - Proxmox network bridge recorded in the OVF Description field
@@ -39,11 +40,29 @@ Notes:
 ### VM prerequisites before export
 
 - Disk on **LVM-thin storage** (`lvmthin`, any storage name — the script reads the LVM block device directly)
+- Run as **root on the Proxmox host**, with Proxmox tools (`qm`, `pvesm`), `lvm2` and `util-linux` (`blockdev`) installed
+- Default allocation-aware mode additionally requires `dmsetup` and `thin-provisioning-tools` (`thin_dump`); these are not needed with `--no-thin-map`
+- Python uses only the standard library: no third-party Python packages. `qemu-utils` (`qemu-img`) is optional, required only for `--verify`
+- Keep the VM **stopped** and every exported source LV **unchanged throughout map capture and conversion**, including with `--no-thin-map`: no guest/host writes, discards/TRIM, or other modifications
 - Netplan without `match: macaddress` and without `set-name` — otherwise networking breaks after import (MAC address changes)
   ```bash
   sudo sed -i '/match:/,/macaddress:/d; /set-name:/d' /etc/netplan/00-installer-config.yaml
   sudo netplan apply
   ```
+
+### Allocation-aware reads and safety
+
+By default, only ranges mapped in LVM-thin metadata are read. Unmapped ranges become logical VMDK holes without source reads or grain payloads. Mapped grains containing only zeros are still sparsified by zero detection; this also remains enabled with `--no-thin-map`.
+
+Thin metadata describes block allocation, not filesystem free space: **deleted files without discard are not skipped**. Partially discarded chunks that remain mapped are still read; only ranges actually unmapped in thin metadata can be skipped.
+
+A short-lived thin-pool **metadata reservation is not a data snapshot**: it protects the mapping tree, not source contents, and is released before conversion. No temporary thin LV or data snapshot is created. Other VMs may use the pool, but exported LVs must remain unchanged. VM stopped-status checks immediately before map capture and after conversion detect some violations; they are **not a write lock** or a substitute for keeping sources offline and unchanged.
+
+Discovery follows device-mapper **major/minor identifiers**, supporting arbitrary VG and thin-pool names without assuming `pve` or `data`. Unsupported topologies (including stacked or multi-segment layouts), external origins (unmapped regions may contain origin data), an already-held metadata reservation, or missing allocation-map tools cause an actionable error. Another process's reservation is never reused or released. Install missing tools or resolve the reported issue; when appropriate, explicitly rerun with **`--no-thin-map`** to read the full logical source device without an allocation map or metadata reservation. **Fallback is never silent or automatic**; it does not relax source-safety requirements or add support for non-`lvmthin` storage.
+
+Logical VMDK holes omit unmapped/all-zero grain payloads while preserving virtual disk capacity and offsets. This is separate from **physical hole punching during OVA packaging**, which releases already-packed portions of the intermediate VMDK on the output filesystem.
+
+Conversion speed is **logical throughput** (virtual disk bytes processed per second, including skipped ranges), not physical source-read bandwidth. Per-disk reporting distinguishes logical size, mapped bytes to read, and skipped bytes; progress advances through skipped ranges too.
 
 ### Export workflow
 
@@ -72,6 +91,7 @@ pvstream2ova --vmid <ID> --out /var/lib/vz/import/ --log /var/log/pvstream2ova-<
 --level   1-9     zlib compression level (default: 6)
 --log     FILE    Write detailed log to FILE
 --verify          Run qemu-img check on each VMDK after conversion
+--no-thin-map     Read the full source device without a thin map (explicit fallback)
 ```
 
 ### Import workflow on Proxmox GUI
@@ -152,8 +172,9 @@ The efivarfs file count WARN appeared in the first validation run before the pve
 
 ### Caratteristiche
 
+- **Letture basate sull'allocazione per default**: salta gli intervalli LVM-thin non mappati; `--no-thin-map` seleziona esplicitamente la lettura dell'intero dispositivo
 - **zlib parallelo**: ogni grain VMDK (64 KiB) viene compresso in un thread separato via `ThreadPoolExecutor` — default `min(32, cpu_count)` thread, ~476 MiB/s su disco da 100 GB
-- **Hole-punch streaming**: il VMDK viene bucherellato (`fallocate FALLOC_FL_PUNCH_HOLE`) man mano che viene riversato nell'OVA — il picco di spazio disco occupato è uguale alla dimensione dell'OVA finale, mai di più
+- **Hole-punch fisico in streaming**: il VMDK viene bucherellato (`fallocate FALLOC_FL_PUNCH_HOLE`) man mano che viene riversato nell'OVA — il picco di spazio disco occupato è uguale alla dimensione dell'OVA finale, mai di più
 - OVF 1.0 + SHA256 manifest (.mf) per compatibilità VMware/VirtualBox/QNAP
 - Warning automatici: VirtIO SCSI, efidisk0 skip, BIOS OVMF
 - Network bridge Proxmox nella Description OVF
@@ -179,11 +200,29 @@ Note:
 ### Prerequisiti VM prima dell'export
 
 - Disco su **storage LVM-thin** (`lvmthin`, qualsiasi nome — lo script legge block device LVM direttamente)
+- Eseguire come **root sull'host Proxmox**, con gli strumenti Proxmox (`qm`, `pvesm`), `lvm2` e `util-linux` (`blockdev`) installati
+- La modalità predefinita basata sull'allocazione richiede anche `dmsetup` e `thin-provisioning-tools` (`thin_dump`); non sono necessari con `--no-thin-map`
+- Python usa solo la libreria standard: nessun pacchetto Python di terze parti. `qemu-utils` (`qemu-img`) è opzionale, richiesto solo per `--verify`
+- Mantenere la VM **spenta** e ogni LV sorgente esportato **immutato per tutta l'acquisizione della mappa e la conversione**, anche con `--no-thin-map`: nessuna scrittura guest/host, discard/TRIM o altra modifica
 - Netplan senza `match: macaddress` e senza `set-name` — altrimenti la rete non funziona post-import
   ```bash
   sudo sed -i '/match:/,/macaddress:/d; /set-name:/d' /etc/netplan/00-installer-config.yaml
   sudo netplan apply
   ```
+
+### Letture basate sull'allocazione e sicurezza
+
+Per default vengono letti solo gli intervalli mappati nei metadati LVM-thin. Gli intervalli non mappati diventano buchi logici nel VMDK, senza letture dalla sorgente né payload dei grain. I grain mappati contenenti solo zeri vengono comunque resi sparsi tramite il rilevamento degli zeri, attivo anche con `--no-thin-map`.
+
+I metadati thin descrivono l'allocazione dei blocchi, non lo spazio libero del filesystem: **i file eliminati senza discard non vengono saltati**. I chunk parzialmente scartati che restano mappati vengono ancora letti; si possono saltare solo gli intervalli realmente non mappati nei metadati thin.
+
+Una breve **prenotazione dei metadati del thin pool non è uno snapshot dei dati**: protegge l'albero delle mappature, non il contenuto sorgente, e viene rilasciata prima della conversione. Non viene creato alcun LV thin temporaneo né snapshot dei dati. Altre VM possono usare il pool, ma gli LV esportati devono restare immutati. I controlli dello stato spento della VM subito prima dell'acquisizione della mappa e dopo la conversione rilevano alcune violazioni; **non sono un blocco delle scritture** e non sostituiscono l'obbligo di mantenere le sorgenti offline e immutate.
+
+Il rilevamento segue gli **identificatori major/minor** di device-mapper e supporta nomi arbitrari di VG e thin pool, senza presumere `pve` o `data`. Topologie non supportate (inclusi layout a strati o multi-segmento), origini esterne (gli intervalli non mappati possono contenere dati dell'origine), una prenotazione dei metadati già attiva o strumenti per la mappa mancanti causano un errore con indicazioni su come procedere. La prenotazione di un altro processo non viene mai riutilizzata o rilasciata. Installare gli strumenti mancanti o risolvere il problema segnalato; quando appropriato, rieseguire esplicitamente con **`--no-thin-map`** per leggere l'intero dispositivo logico sorgente senza mappa di allocazione né prenotazione dei metadati. **Il fallback non è mai silenzioso o automatico**: non attenua i requisiti di sicurezza della sorgente e non aggiunge supporto a storage diversi da `lvmthin`.
+
+I buchi logici del VMDK omettono i payload dei grain non mappati/interamente zero, preservando capacità e offset del disco virtuale. Sono distinti dall'**hole punching fisico durante il packaging OVA**, che libera sul filesystem di output le porzioni del VMDK intermedio già inserite nell'archivio.
+
+La velocità di conversione è **throughput logico** (byte del disco virtuale elaborati al secondo, inclusi gli intervalli saltati), non banda fisica di lettura dalla sorgente. Il riepilogo per disco distingue dimensione logica, byte mappati da leggere e byte saltati; l'avanzamento comprende anche gli intervalli saltati.
 
 ### Workflow export
 
@@ -212,6 +251,7 @@ pvstream2ova --vmid <ID> --out /var/lib/vz/import/ --log /var/log/pvstream2ova-<
 --level   1-9     Livello compressione zlib (default: 6)
 --log     FILE    Log dettagliato su file
 --verify          Esegue qemu-img check su ogni VMDK
+--no-thin-map     Legge l'intero dispositivo sorgente senza mappa thin (fallback esplicito)
 ```
 
 ### Workflow import su Proxmox GUI

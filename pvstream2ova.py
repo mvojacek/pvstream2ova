@@ -6,7 +6,7 @@ Peak disk usage = one VMDK; freed by fallocate hole-punching while streaming int
 Generates OVF 1.0 descriptor and SHA256 manifest (.mf) for VMware/VirtualBox compatibility.
 
 Usage: pvstream2ova.py --vmid <ID> [--out <dir>] [--tmp <dir>] [--name <name>]
-                       [--workers N] [--level 1-9] [--log <file>] [--verify]
+                       [--workers N] [--level 1-9] [--log <file>] [--verify] [--no-thin-map]
 """
 
 from __future__ import annotations
@@ -17,15 +17,21 @@ import hashlib
 import logging
 import os
 import re
+import select
+import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
+import xml.etree.ElementTree as ET
 import zlib
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable
+from typing import BinaryIO, Callable
 
 log = logging.getLogger("pvstream2ova")
 
@@ -185,16 +191,29 @@ def _meta_marker(num_data_sectors: int, mtype: int) -> bytes:
     return bytes(buf)
 
 
-def _compress_batch(raw: bytes, level: int) -> list[bytes | None]:
+def _pread_exact(fd: int, size: int, offset: int) -> bytes:
+    data = os.pread(fd, size, offset)
+    if len(data) == size:
+        return data
+    result = bytearray(data)
+    while len(result) < size:
+        if not data:
+            raise EOFError(f"Premature EOF at source byte {offset + len(result)}; "
+                           f"expected {size} bytes at {offset}")
+        data = os.pread(fd, size - len(result), offset + len(result))
+        result.extend(data)
+    return bytes(result)
+
+
+def _compress_batch(raw: bytes | bytearray, level: int,
+                    mapped_grains: bytearray | None = None) -> list[bytes | None]:
     results = []
-    offset  = 0
-    while offset < len(raw):
+    for gi, offset in enumerate(range(0, len(raw), GRAIN_SIZE)):
+        if mapped_grains is not None and not mapped_grains[gi]:
+            results.append(None)
+            continue
         grain = raw[offset:offset + GRAIN_SIZE]
-        if not grain:
-            break
-        # None = all-zero grain; caller skips it (sparse: not written to VMDK)
         results.append(None if not any(grain) else zlib.compress(grain, level=level))
-        offset += GRAIN_SIZE
     return results
 
 
@@ -215,16 +234,30 @@ class _HashingFile:
 
 class VmdkWriter:
     def __init__(self, src: str, dst: Path, workers: int, level: int = 6,
-                 on_progress: Callable[[int, int], None] | None = None) -> None:
+                 on_progress: Callable[[int, int], None] | None = None,
+                 mapped_ranges: list[tuple[int, int]] | None = None,
+                 src_size: int | None = None) -> None:
+        if workers < 1:
+            raise ValueError("Compression workers must be positive")
         self._src      = src
         self._dst      = dst
         self._workers  = workers
         self._level    = level
         self._progress = on_progress
+        self._ranges   = mapped_ranges
+        self._size     = src_size
 
     def convert(self) -> str:
         """Convert LVM block device to VMDK streamOptimized; returns SHA256 of output."""
-        src_size         = int(subprocess.check_output(["blockdev", "--getsize64", self._src]).strip())
+        src_size = _source_size(self._src)
+        if self._size is not None and src_size != self._size:
+            raise RuntimeError("Source capacity changed after thin-map capture")
+        previous_end = 0
+        if self._ranges is not None:
+            for start, end in self._ranges:
+                if not (0 <= previous_end <= start < end <= src_size):
+                    raise ValueError("Mapped ranges must be ordered, non-overlapping and in capacity")
+                previous_end = end
         capacity_sectors = src_size // 512
         n_grains         = (src_size + GRAIN_SIZE - 1) // GRAIN_SIZE
 
@@ -269,17 +302,42 @@ class VmdkWriter:
 
         pending      = []
         next_submit  = 0
+        range_cursor = 0
 
         def submit_next() -> None:
-            nonlocal next_submit
+            nonlocal next_submit, range_cursor
             if next_submit >= n_grains:
                 return
-            bs        = next_submit
-            read_size = min(BATCH_GRAINS * GRAIN_SIZE, src_size - bs * GRAIN_SIZE)
-            pending.append((bs, pool.submit(_compress_batch,
-                                            os.pread(src_fd, read_size, bs * GRAIN_SIZE),
-                                            self._level)))
-            next_submit += BATCH_GRAINS
+            bs = next_submit
+            count = min(BATCH_GRAINS, n_grains - bs)
+            start = bs * GRAIN_SIZE
+            end = min(start + count * GRAIN_SIZE, src_size)
+            mapped_grains = None
+            raw = None
+            if self._ranges is None:
+                raw = _pread_exact(src_fd, end - start, start)
+                raw += b"\x00" * (count * GRAIN_SIZE - len(raw))
+            else:
+                while range_cursor < len(self._ranges):
+                    lo, hi = self._ranges[range_cursor]
+                    if lo >= end:
+                        break
+                    lo, stop = max(lo, start), min(hi, end)
+                    if lo < stop:
+                        if raw is None:
+                            raw = bytearray(count * GRAIN_SIZE)
+                            mapped_grains = bytearray(count)
+                        raw[lo - start:stop - start] = _pread_exact(src_fd, stop - lo, lo)
+                        first = (lo - start) // GRAIN_SIZE
+                        last = (stop - start - 1) // GRAIN_SIZE + 1
+                        mapped_grains[first:last] = b"\x01" * (last - first)
+                    if hi > end:
+                        break
+                    range_cursor += 1
+            future = (pool.submit(_compress_batch, raw, self._level, mapped_grains)
+                      if raw is not None else None)
+            pending.append((bs, count, future))
+            next_submit += count
 
         # Prefill queue with 2× workers batches so threads stay busy while results are consumed
         for _ in range(self._workers * 2):
@@ -287,12 +345,13 @@ class VmdkWriter:
 
         grains_done = 0
         while pending:
-            batch_start, future = pending.pop(0)
+            batch_start, count, future = pending.pop(0)
             submit_next()
-            for ci, cdata in enumerate(future.result()):
+            compressed = future.result() if future is not None else [None] * count
+            if len(compressed) != count or batch_start != grains_done:
+                raise RuntimeError("Invalid compression batch grain count or ordering")
+            for ci, cdata in enumerate(compressed):
                 gi = batch_start + ci
-                if gi >= n_grains:
-                    break
                 if cdata is not None:
                     grain_offsets[gi] = cur_sector
                     blob = struct.pack("<QI", gi * GRAIN_SECTS, len(cdata)) + cdata
@@ -303,10 +362,12 @@ class VmdkWriter:
                 if grains_done % GT_COVERAGE == 0:
                     flush_gt(grains_done - GT_COVERAGE)
                 if self._progress:
-                    self._progress(grains_done * GRAIN_SIZE, src_size)
+                    self._progress(min(grains_done * GRAIN_SIZE, src_size), src_size)
 
         if grains_done % GT_COVERAGE:
             flush_gt(grains_done - grains_done % GT_COVERAGE)
+        if grains_done != n_grains or len(gd_entries) != (n_grains + GT_COVERAGE - 1) // GT_COVERAGE:
+            raise RuntimeError("Incomplete VMDK grain tables")
 
         gd_data  = struct.pack(f"<{len(gd_entries)}I", *gd_entries)
         gd_pad   = (-len(gd_data)) % 512
@@ -324,8 +385,382 @@ class VmdkWriter:
 
 # ── Proxmox helpers ───────────────────────────────────────────────────────────
 
-def _run(*cmd: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(list(cmd), check=check, capture_output=True, text=True)
+def _run(*cmd: str, check: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(list(cmd), check=check, capture_output=True, text=True, timeout=timeout)
+
+
+def _thin_uint(value: str, field: str) -> int:
+    if not re.fullmatch(r"[0-9]+", value):
+        raise ValueError(f"Invalid {field}: {value[:80]!r}")
+    return int(value)
+
+
+def _thin_error(exc: BaseException) -> str:
+    detail = str(exc)
+    if isinstance(exc, subprocess.CalledProcessError):
+        output = exc.stderr or exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        detail += f": {output.strip()}" if output else ""
+    return detail[:4096]
+
+
+def _source_size(src: str) -> int:
+    try:
+        size = _thin_uint(_run("blockdev", "--getsize64", src).stdout.strip(), "source size")
+        if size <= 0 or size % 512:
+            raise ValueError(f"Source size must be positive and 512-byte aligned, got {size}")
+        return size
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            f"Cannot size {src}: {_thin_error(exc)}; ensure the LV is active and "
+            "blockdev (util-linux) is installed") from exc
+
+
+def _check_thin_tools() -> None:
+    missing = [name for name in ("dmsetup", "thin_dump") if shutil.which(name) is None]
+    if missing:
+        raise RuntimeError(
+            f"Missing thin-map tools: {', '.join(missing)}; install dmsetup and "
+            "thin-provisioning-tools (provides thin_dump), or use --no-thin-map "
+            "to read the full device")
+
+
+def _thin_target(output: str, target: str) -> tuple[int, list[str]]:
+    lines = [line.split() for line in output.splitlines() if line.strip()]
+    if len(lines) != 1 or len(lines[0]) < 3:
+        raise ValueError(f"Expected one {target} target, not a stacked or multi-segment layout")
+    fields = lines[0]
+    start = _thin_uint(fields[0], "target start")
+    length = _thin_uint(fields[1], "target length")
+    if start != 0 or length == 0 or fields[2] != target:
+        raise ValueError(f"Expected a positive, zero-based {target} target")
+    return length, fields[3:]
+
+
+def _thin_devno(value: str) -> tuple[int, int]:
+    if not re.fullmatch(r"[0-9]+:[0-9]+", value):
+        raise ValueError(f"Expected device major:minor, got {value[:80]!r}")
+    major, minor = value.split(":")
+    return int(major), int(minor)
+
+
+def _thin_held_root(pool: tuple[str, ...], pool_length: int) -> int | None:
+    length, fields = _thin_target(_run("dmsetup", "status", *pool, timeout=30).stdout, "thin-pool")
+    if length != pool_length or len(fields) < 8:
+        raise ValueError("Invalid thin-pool status or changed pool size")
+    _thin_uint(fields[0], "pool transaction")
+    for usage in fields[1:3]:
+        parts = usage.split("/")
+        if len(parts) != 2:
+            raise ValueError("Invalid thin-pool usage counters")
+        used, total = (_thin_uint(part, "pool usage") for part in parts)
+        if used > total:
+            raise ValueError("Thin-pool usage exceeds its capacity")
+    if fields[4] not in ("rw", "ro", "out_of_data_space") or fields[7] != "-":
+        raise ValueError("Thin pool is failed or needs checking")
+    if fields[3] == "-":
+        return None
+    root = _thin_uint(fields[3], "held metadata root")
+    if root == 0:
+        raise ValueError("Invalid zero held metadata root")
+    return root
+
+
+def _parse_thin_dump(stream: BinaryIO, thin_id: int, data_block_sectors: int,
+                     src_size: int) -> list[tuple[int, int]]:
+    if not 0 <= thin_id < (1 << 24):
+        raise ValueError("Thin device ID must fit in 24 bits")
+    if data_block_sectors <= 0 or src_size <= 0 or src_size % 512:
+        raise ValueError("Invalid thin block size or source capacity")
+    chunk_bytes = data_block_sectors * 512
+    ranges: list[tuple[int, int]] = []
+    stack: list[ET.Element] = []
+    seen_superblock = False
+    seen_device = False
+    mapped_blocks = 0
+    expected_blocks = 0
+    previous_end = 0
+    completed = None
+
+    def integer(element: ET.Element, field: str) -> int:
+        value = _thin_uint(element.get(field, ""), f"{element.tag}.{field}")
+        if value >= (1 << 64):
+            raise ValueError(f"{element.tag}.{field} exceeds 64 bits")
+        return value
+
+    for event, element in ET.iterparse(stream, events=("start", "end")):
+        if completed is not None:
+            if completed.tail and completed.tail.strip():
+                raise ValueError(f"Unexpected text after thin XML element {completed.tag!r}")
+            completed.clear()
+            completed = None
+        if event == "start":
+            if not stack:
+                if element.tag != "superblock" or seen_superblock:
+                    raise ValueError("Expected exactly one thin metadata superblock")
+                seen_superblock = True
+                if "uuid" not in element.attrib:
+                    raise ValueError("Missing superblock.uuid")
+                for field in ("time", "transaction", "nr_data_blocks"):
+                    integer(element, field)
+                for field in ("flags", "version", "metadata_snap"):
+                    if field in element.attrib:
+                        integer(element, field)
+                if integer(element, "data_block_size") != data_block_sectors:
+                    raise ValueError("XML data_block_size does not match the thin-pool table")
+            elif len(stack) == 1 and element.tag == "device":
+                if seen_device or integer(element, "dev_id") != thin_id:
+                    raise ValueError(f"Expected exactly thin device {thin_id}")
+                seen_device = True
+                expected_blocks = integer(element, "mapped_blocks")
+                for field in ("transaction", "creation_time", "snap_time"):
+                    integer(element, field)
+            elif len(stack) == 2 and element.tag in ("range_mapping", "single_mapping"):
+                if stack[-1].tag != "device":
+                    raise ValueError("Mapping outside a thin device")
+                integer(element, "time")
+                if element.tag == "range_mapping":
+                    origin = integer(element, "origin_begin")
+                    length = integer(element, "length")
+                    integer(element, "data_begin")
+                else:
+                    origin = integer(element, "origin_block")
+                    length = 1
+                    integer(element, "data_block")
+                end = origin + length
+                if length == 0 or end > (1 << 64) or origin < previous_end:
+                    raise ValueError("Invalid, unordered or overlapping thin mapping")
+                previous_end = end
+                mapped_blocks += length
+                if mapped_blocks > expected_blocks:
+                    raise ValueError("Thin mappings exceed device.mapped_blocks")
+                start_byte = origin * chunk_bytes
+                end_byte = min(end * chunk_bytes, src_size)
+                if start_byte < end_byte:
+                    if ranges and ranges[-1][1] == start_byte:
+                        ranges[-1] = (ranges[-1][0], end_byte)
+                    else:
+                        ranges.append((start_byte, end_byte))
+            else:
+                raise ValueError(f"Unsupported thin XML element: {element.tag!r}")
+            stack.append(element)
+        else:
+            if element.text and element.text.strip():
+                raise ValueError(f"Unexpected text in thin XML element {element.tag!r}")
+            if element.tag == "device" and mapped_blocks != expected_blocks:
+                raise ValueError("Thin mapping count does not match device.mapped_blocks")
+            stack.pop()
+            if stack:
+                stack[-1].remove(element)
+            completed = element
+    if not seen_superblock or not seen_device or stack:
+        raise ValueError(f"Missing or incomplete metadata for thin device {thin_id}")
+    return ranges
+
+
+def _stop_thin_dump(pid: int) -> None:
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0]:
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                return
+            time.sleep(0.05)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+@contextmanager
+def _deferred_termination():
+    pending = []
+    handlers = {}
+
+    def defer(sig, _frame):
+        pending.append(sig)
+
+    def check():
+        if pending:
+            raise SystemExit(f"Interrupted (signal {pending[0]})")
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            handlers[sig] = signal.signal(sig, defer)
+        yield check
+    finally:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+        try:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        if sys.exc_info()[0] is None:
+            check()
+
+
+class _ThinDumpReader:
+    def __init__(self, stream, check_interrupt):
+        self._stream = stream
+        self._check = check_interrupt
+
+    def read(self, size):
+        while True:
+            self._check()
+            if select.select([self._stream], [], [], 0.1)[0]:
+                return self._stream.read(size)
+
+
+def _thin_reserved_map(pool: tuple[str, ...], pool_length: int, metadata: str,
+                       thin_id: int, data_block_sectors: int,
+                       src_size: int) -> list[tuple[int, int]]:
+    identity = f"{pool[1]}:{pool[3]}"
+    if _thin_held_root(pool, pool_length) is not None:
+        raise RuntimeError(f"Pool {identity} already has a metadata reservation; leaving it untouched")
+    owned = False
+    pid = None
+    read_fd = write_fd = None
+    signals = {signal.SIGINT, signal.SIGTERM}
+    recovery = (f"Pool {identity}, metadata {metadata}: after confirming no thin_dump or other "
+                f"metadata reader remains, inspect dmsetup status {' '.join(pool)} and, "
+                f"if our reservation is still held, run dmsetup message {' '.join(pool)} "
+                "0 release_metadata_snap")
+    with _deferred_termination() as check_interrupt, tempfile.TemporaryFile() as errors:
+        try:
+            try:
+                check_interrupt()
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+                try:
+                    _run("dmsetup", "message", *pool, "0", "reserve_metadata_snap")
+                    owned = True
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                check_interrupt()
+                root = _thin_held_root(pool, pool_length)
+                check_interrupt()
+                if root is None:
+                    raise RuntimeError(f"Pool {identity} did not expose the reserved metadata root")
+                command = ["thin_dump", "--format", "xml", "--dev-id", str(thin_id),
+                           f"--metadata-snap={root}", metadata]
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+                try:
+                    read_fd, write_fd = os.pipe()
+                    pid = os.posix_spawnp(
+                        command[0], command, os.environ,
+                        file_actions=[(os.POSIX_SPAWN_DUP2, write_fd, 1),
+                                      (os.POSIX_SPAWN_DUP2, errors.fileno(), 2),
+                                      (os.POSIX_SPAWN_CLOSE, read_fd),
+                                      (os.POSIX_SPAWN_CLOSE, write_fd)],
+                        setsigmask=previous_mask, setsigdef=(signal.SIGPIPE,))
+                    os.close(write_fd)
+                    write_fd = None
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                with os.fdopen(read_fd, "rb", buffering=0) as stream:
+                    read_fd = None
+                    reader = _ThinDumpReader(stream, check_interrupt)
+                    ranges = _parse_thin_dump(reader, thin_id, data_block_sectors, src_size)
+                while True:
+                    check_interrupt()
+                    finished, status = os.waitpid(pid, os.WNOHANG)
+                    if finished:
+                        break
+                    time.sleep(0.05)
+                pid = None
+                returncode = os.waitstatus_to_exitcode(status)
+                if returncode:
+                    raise RuntimeError(f"thin_dump exited with status {returncode}")
+                return ranges
+            finally:
+                original_error = sys.exc_info()[1]
+                cleanup_error = None
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+                try:
+                    if pid is not None:
+                        try:
+                            _stop_thin_dump(pid)
+                        except Exception as exc:
+                            cleanup_error = RuntimeError(
+                                f"Cannot terminate/reap thin_dump PID {pid}; reservation retained. "
+                                f"{recovery}. Failure: {_thin_error(exc)}")
+                    for fd in (read_fd, write_fd):
+                        if fd is not None:
+                            try:
+                                os.close(fd)
+                            except OSError as exc:
+                                log.warning("Cannot close thin_dump pipe: %s", _thin_error(exc))
+                    if owned and cleanup_error is None:
+                        try:
+                            _run("dmsetup", "message", *pool, "0", "release_metadata_snap")
+                        except Exception as exc:
+                            cleanup_error = RuntimeError(
+                                f"Cannot release our metadata reservation. {recovery}. "
+                                f"Failure: {_thin_error(exc)}")
+                    if cleanup_error is not None:
+                        if original_error is not None:
+                            log.error("%s; preserving original failure: %s", cleanup_error,
+                                      _thin_error(original_error))
+                        else:
+                            raise cleanup_error
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        except Exception as exc:
+            errors.seek(0, os.SEEK_END)
+            size = errors.tell()
+            errors.seek(max(0, size - 4096))
+            detail = errors.read(4096).decode("utf-8", errors="replace").strip()
+            suffix = f"; thin_dump stderr: {detail}" if detail else ""
+            raise RuntimeError(f"{_thin_error(exc)}{suffix}") from exc
+
+
+def _thin_map(lv_path: str, src_size: int) -> list[tuple[int, int]]:
+    try:
+        _check_thin_tools()
+        if src_size <= 0 or src_size % 512:
+            raise ValueError("Source capacity must be positive and 512-byte aligned")
+        length, fields = _thin_target(_run("dmsetup", "table", lv_path).stdout, "thin")
+        if length * 512 != src_size:
+            raise ValueError("Thin target does not span the source capacity")
+        if len(fields) == 3:
+            raise ValueError("External-origin thin devices may contain data in unmapped ranges")
+        if len(fields) != 2:
+            raise ValueError("Unsupported thin target arguments")
+        major, minor = _thin_devno(fields[0])
+        thin_id = _thin_uint(fields[1], "thin device ID")
+        if thin_id >= (1 << 24):
+            raise ValueError("Thin device ID must fit in 24 bits")
+        pool = ("-j", str(major), "-m", str(minor))
+        pool_length, fields = _thin_target(_run("dmsetup", "table", *pool).stdout, "thin-pool")
+        if len(fields) < 4:
+            raise ValueError("Incomplete thin-pool target")
+        metadata_major, metadata_minor = _thin_devno(fields[0])
+        _thin_devno(fields[1])
+        data_block_sectors = _thin_uint(fields[2], "pool data block size")
+        if not 128 <= data_block_sectors <= 2097152 or data_block_sectors % 128:
+            raise ValueError("Invalid thin-pool data block size")
+        _thin_uint(fields[3], "pool low water mark")
+        if len(fields) > 4 and _thin_uint(fields[4], "pool feature count") != len(fields) - 5:
+            raise ValueError("Invalid thin-pool feature count")
+        metadata = Path(f"/dev/block/{metadata_major}:{metadata_minor}").resolve(strict=True)
+        info = metadata.stat()
+        if not stat.S_ISBLK(info.st_mode) or (os.major(info.st_rdev), os.minor(info.st_rdev)) != (
+                metadata_major, metadata_minor):
+            raise ValueError(f"Metadata path {metadata} is not the expected block device")
+        return _thin_reserved_map(pool, pool_length, str(metadata), thin_id,
+                                  data_block_sectors, src_size)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot obtain thin map for {lv_path}: {_thin_error(exc)}; "
+            "use --no-thin-map to read the full device instead") from exc
 
 
 def _lv(action: str, lv_path: str) -> None:
@@ -517,7 +952,7 @@ def _fmt_dur(s: float) -> str:
     return f"{h}h {m:02d}m {s:02d}s" if h else (f"{m}m {s:02d}s" if m else f"{s}s")
 
 
-def _make_progress(label: str, total: int) -> Callable[[int, int], None]:
+def _make_progress(label: str, total: int, logical: bool = False) -> Callable[[int, int], None]:
     t0 = time.monotonic(); last_logged = [-1]; last_print = [0.0]
 
     def show(done: int, _total: int) -> None:
@@ -531,14 +966,15 @@ def _make_progress(label: str, total: int) -> Callable[[int, int], None]:
             eta   = _fmt_dur((_total - done) / (done / dt) if done else 0)
         else:
             speed = 0.0; eta = "--"
+        unit = "logical MiB/s" if logical else "MiB/s"
         print(f"\r  {pct:3d}%  {done >> 20}/{_total >> 20} MiB"
-              f"  {speed:.1f} MiB/s  {_fmt_dur(dt)} elapsed  ETA {eta}   ",
+              f"  {speed:.1f} {unit}  {_fmt_dur(dt)} elapsed  ETA {eta}   ",
               end="", flush=True)
         decile = pct // 10
         if decile != last_logged[0]:
             last_logged[0] = decile
-            log.info("%s %d%%  %d/%d MiB  %.1f MiB/s  %s elapsed  ETA %s",
-                     label, pct, done >> 20, _total >> 20, speed, _fmt_dur(dt), eta)
+            log.info("%s %d%%  %d/%d MiB  %.1f %s  %s elapsed  ETA %s",
+                     label, pct, done >> 20, _total >> 20, speed, unit, _fmt_dur(dt), eta)
     return show
 
 
@@ -559,7 +995,10 @@ def _setup_logging(log_path: Path | None) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Export Proxmox VM to OVA — parallel VMDK compression + streaming hole-punch")
+        description="Export Proxmox VM to OVA — allocation-aware reads + parallel VMDK compression",
+        epilog="Requires dmsetup and thin_dump (thin-provisioning-tools) by default. "
+               "Keep the VM stopped and its disks unchanged throughout export: a metadata "
+               "reservation is not a data snapshot or a write lock.")
     ap.add_argument("--vmid",    type=int,  required=True, metavar="ID",
                     help="Proxmox VM ID")
     ap.add_argument("--out",     type=Path, default=Path("/var/lib/vz/import"), metavar="DIR",
@@ -576,7 +1015,12 @@ def main() -> None:
                     help="Append detailed log to FILE")
     ap.add_argument("--verify",  action="store_true",
                     help="Run qemu-img check on each VMDK after conversion")
+    ap.add_argument("--no-thin-map", action="store_true",
+                    help="Read the full device without thin metadata (explicit fallback); "
+                         "zero grains are still omitted")
     args = ap.parse_args()
+    if args.workers < 1:
+        ap.error("--workers must be positive")
 
     _setup_logging(args.log)
 
@@ -615,18 +1059,21 @@ def main() -> None:
 
     vmdk_paths: list[Path] = []
 
-    def _cleanup(sig=None, _frame=None) -> None:
+    def _cleanup() -> None:
         for p in vmdk_paths:
             p.unlink(missing_ok=True)
-        if sig is not None:
-            log.warning("Interrupted (signal %s)", sig)
-            sys.exit(1)
 
-    signal.signal(signal.SIGINT,  _cleanup)
-    signal.signal(signal.SIGTERM, _cleanup)
+    def _interrupt(sig, _frame) -> None:
+        log.warning("Interrupted (signal %s)", sig)
+        raise SystemExit(f"Interrupted (signal {sig})")
+
+    previous_handlers = {sig: signal.signal(sig, _interrupt)
+                         for sig in (signal.SIGINT, signal.SIGTERM)}
     t_start = time.monotonic()
 
     try:
+        if not args.no_thin_map:
+            _check_thin_tools()
         disk_meta   = []
         vmdk_hashes = []  # (filename, sha256) collected during conversion for .mf
 
@@ -638,20 +1085,33 @@ def main() -> None:
             print(f"[{i}] {lv}  →  {vmdk.name}")
             log.info("[disk %d] %s → %s", i, lv, vmdk.name)
             t_disk = time.monotonic()
-            _lv("y", lv_path)
             try:
-                vsize    = int(subprocess.check_output(["blockdev", "--getsize64", lv_path]).strip())
+                _lv("y", lv_path)
+                vsize = _source_size(lv_path)
+                if _vm_status(args.vmid) != "stopped":
+                    raise RuntimeError(f"VM {args.vmid} must remain stopped; refusing map capture")
+                mapped_ranges = None if args.no_thin_map else _thin_map(lv_path, vsize)
+                mapped_bytes = (vsize if mapped_ranges is None else
+                                sum(end - start for start, end in mapped_ranges))
+                summary = (f"Logical size: {vsize} bytes; "
+                           f"{'full-device' if mapped_ranges is None else 'mapped'} bytes to read: "
+                           f"{mapped_bytes}; skipped: {vsize - mapped_bytes} bytes")
+                print(f"  {summary}")
+                log.info("[disk %d] %s", i, summary)
                 vmdk_sha = VmdkWriter(
                     src=lv_path, dst=vmdk, workers=args.workers, level=args.level,
-                    on_progress=_make_progress(f"disk{i}", vsize),
+                    on_progress=_make_progress(f"disk{i}", vsize, logical=True),
+                    mapped_ranges=mapped_ranges, src_size=vsize,
                 ).convert()
+                if _vm_status(args.vmid) != "stopped":
+                    raise RuntimeError(f"VM {args.vmid} did not remain stopped; discarding export")
             finally:
                 _lv("n", lv_path)
 
             elapsed   = time.monotonic() - t_disk
             vmdk_size = vmdk.stat().st_size
             print(f"\n  → {vmdk.name}  {vmdk_size >> 20} MiB"
-                  f"  ({_fmt_dur(elapsed)}, {vsize / elapsed / (1 << 20):.1f} MiB/s)")
+                  f"  ({_fmt_dur(elapsed)}, {vsize / elapsed / (1 << 20):.1f} logical MiB/s)")
             log.info("[disk %d] done: %d MiB → %d MiB in %s",
                      i, vsize >> 20, vmdk_size >> 20, _fmt_dur(elapsed))
 
@@ -690,8 +1150,13 @@ def main() -> None:
 
     except Exception as exc:
         log.error("Fatal: %s", exc, exc_info=True)
-        _cleanup()
         raise SystemExit(f"Error: {exc}") from exc
+    finally:
+        try:
+            _cleanup()
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
 
     elapsed = time.monotonic() - t_start
     gb      = ova_path.stat().st_size / 1024 ** 3
