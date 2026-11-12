@@ -328,12 +328,27 @@ def _run(*cmd: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(list(cmd), check=check, capture_output=True, text=True)
 
 
-def _lv(action: str, lv: str) -> None:
-    _run("lvchange", f"-a{action}", f"pve/{lv}", check=(action == "y"))
+def _lv(action: str, lv_path: str) -> None:
+    _run("lvchange", f"-a{action}", lv_path, check=(action == "y"))
 
 
 def _vm_status(vmid: int) -> str:
     return _run("qm", "status", str(vmid)).stdout.split()[-1]
+
+
+def _check_disk_storages(disks: list[str]) -> None:
+    storage_types = {
+        name: storage_type
+        for storage_type, name in re.findall(
+            r"^(\S+):[ \t]+(\S+)", Path("/etc/pve/storage.cfg").read_text(), re.MULTILINE)
+    }
+    for disk in disks:
+        storage = disk.split(":", 1)[0]
+        storage_type = storage_types.get(storage)
+        if storage_type != "lvmthin":
+            raise SystemExit(
+                f"Disk {disk}: storage '{storage}' must be lvmthin "
+                f"(found {storage_type or 'unknown'})")
 
 
 def _vm_config(vmid: int) -> dict:
@@ -366,7 +381,7 @@ def _vm_config(vmid: int) -> dict:
             log.warning("efidisk0 skipped — EFI NVRAM variables are not portable across hypervisors")
         elif re.match(r"^(virtio|scsi|sata|ide)\d+$", key):
             if "media=cdrom" not in val:
-                m = re.search(r"local-lvm:(vm-\d+-disk-\d+)", val)
+                m = re.match(r"(?:file=)?([^:,\s]+:[^,\s]+)(?:,|$)", val)
                 if m:
                     cfg["disks"].append(m.group(1))
 
@@ -573,6 +588,7 @@ def main() -> None:
     cfg = _vm_config(args.vmid)
     if not cfg["disks"]:
         raise SystemExit("No exportable disks found in VM config")
+    _check_disk_storages(cfg["disks"])
 
     if cfg["scsihw"].startswith("virtio"):
         msg = (f"WARNING: VM uses '{cfg['scsihw']}' — after import on Proxmox "
@@ -616,13 +632,13 @@ def main() -> None:
 
         for i, lv in enumerate(cfg["disks"]):
             vmdk    = args.tmp / f"{name}-disk{i}.vmdk"
-            lv_path = f"/dev/pve/{lv}"
+            lv_path = _run("pvesm", "path", lv).stdout.strip()
             vmdk_paths.append(vmdk)
 
             print(f"[{i}] {lv}  →  {vmdk.name}")
             log.info("[disk %d] %s → %s", i, lv, vmdk.name)
             t_disk = time.monotonic()
-            _lv("y", lv)
+            _lv("y", lv_path)
             try:
                 vsize    = int(subprocess.check_output(["blockdev", "--getsize64", lv_path]).strip())
                 vmdk_sha = VmdkWriter(
@@ -630,7 +646,7 @@ def main() -> None:
                     on_progress=_make_progress(f"disk{i}", vsize),
                 ).convert()
             finally:
-                _lv("n", lv)
+                _lv("n", lv_path)
 
             elapsed   = time.monotonic() - t_disk
             vmdk_size = vmdk.stat().st_size

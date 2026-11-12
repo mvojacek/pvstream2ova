@@ -38,7 +38,7 @@ Notes:
 
 ### VM prerequisites before export
 
-- Disk on **local-lvm** (not local/QCOW2 — the script reads the LVM block device directly)
+- Disk on **LVM-thin storage** (`lvmthin`, any storage name — the script reads the LVM block device directly)
 - Netplan without `match: macaddress` and without `set-name` — otherwise networking breaks after import (MAC address changes)
   ```bash
   sudo sed -i '/match:/,/macaddress:/d; /set-name:/d' /etc/netplan/00-installer-config.yaml
@@ -142,7 +142,7 @@ The efivarfs file count WARN appeared in the first validation run before the pve
 
 ### Storage requirements
 
-- Only **local-lvm** (LVM thin pool) is supported
+- Any storage name is supported, provided its type in `/etc/pve/storage.cfg` is **lvmthin** (LVM thin pool); other or unknown types are rejected before export
 - local (QCOW2), ZFS, Ceph: not supported
 - To move a disk from local to local-lvm: `qm move-disk <vmid> scsi0 local-lvm --delete`
 
@@ -178,7 +178,7 @@ Note:
 
 ### Prerequisiti VM prima dell'export
 
-- Disco su **local-lvm** (non local/QCOW2 — lo script legge block device LVM direttamente)
+- Disco su **storage LVM-thin** (`lvmthin`, qualsiasi nome — lo script legge block device LVM direttamente)
 - Netplan senza `match: macaddress` e senza `set-name` — altrimenti la rete non funziona post-import
   ```bash
   sudo sed -i '/match:/,/macaddress:/d; /set-name:/d' /etc/netplan/00-installer-config.yaml
@@ -282,6 +282,6 @@ Il WARN efivarfs (file count) era presente nella prima validazione prima del fix
 
 ### Storage requirements
 
-- Solo **local-lvm** (LVM thin pool) supportato
+- Qualsiasi nome di storage è supportato, purché il tipo in `/etc/pve/storage.cfg` sia **lvmthin** (LVM thin pool); tipi diversi o sconosciuti vengono rifiutati prima dell'export
 - local (QCOW2), ZFS, Ceph: non supportati
 - Per disco su local: `qm move-disk <vmid> scsi0 local-lvm --delete`
